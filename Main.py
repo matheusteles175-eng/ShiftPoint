@@ -39,8 +39,9 @@ st.markdown("""
 def conectar():
     conn = sqlite3.connect("checkpoint_shift_mateus.db", check_same_thread=False)
     cursor = conn.cursor()
+    # Adicionada coluna km_config para salvar o KM inicial da configuração e calcular o progresso real
     cursor.execute("CREATE TABLE IF NOT EXISTS usuarios (usuario TEXT PRIMARY KEY, senha TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS veiculo (usuario TEXT PRIMARY KEY, km_ini REAL, km_alvo REAL, custo REAL, fipe REAL, guardado_ipva REAL)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS veiculo (usuario TEXT PRIMARY KEY, km_ini REAL, km_alvo REAL, custo REAL, fipe REAL, guardado_ipva REAL, km_config REAL)")
     cursor.execute("CREATE TABLE IF NOT EXISTS metas (id INTEGER PRIMARY KEY, usuario TEXT, item TEXT, valor REAL, data TEXT, guardado REAL)")
     cursor.execute("CREATE TABLE IF NOT EXISTS ganhos (id INTEGER PRIMARY KEY, usuario TEXT, data TEXT, ganho REAL, gasto REAL, km REAL, h_ini TEXT, h_fim TEXT)")
     conn.commit()
@@ -54,7 +55,6 @@ if "autenticado" not in st.session_state: st.session_state.autenticado = False
 if not st.session_state.autenticado:
     st.markdown("<h1 style='text-align: center;'>🏁 CheckPoint Shift</h1>", unsafe_allow_html=True)
     aba_login, aba_cad = st.tabs(["🔑 ACESSAR", "📝 CRIAR CONTA"])
-    
     with aba_login:
         u = st.text_input("Usuário", key="login_user").lower().strip()
         s = st.text_input("Senha", type="password", key="login_pass")
@@ -63,7 +63,6 @@ if not st.session_state.autenticado:
                 st.session_state.autenticado, st.session_state.user = True, u
                 st.rerun()
             else: st.error("Usuário ou senha incorretos.")
-            
     with aba_cad:
         nu = st.text_input("Definir Novo Usuário", key="cad_user").lower().strip()
         ns = st.text_input("Definir Senha", type="password", key="cad_pass")
@@ -71,10 +70,8 @@ if not st.session_state.autenticado:
             if nu and ns:
                 try:
                     cursor.execute("INSERT INTO usuarios (usuario, senha) VALUES (?,?)", (nu, ns))
-                    conn.commit()
-                    st.success("✅ Conta criada! Vá para a aba ACESSAR.")
+                    conn.commit(); st.success("✅ Conta criada! Vá para Login.")
                 except: st.error("❌ Este usuário já existe.")
-            else: st.warning("Preencha todos os campos.")
     st.stop()
 
 user = st.session_state.user
@@ -88,16 +85,18 @@ if v_data is None or st.session_state.editando_veiculo:
     st.header("⚙️ Configuração do Veículo")
     with st.form("cfg_carro"):
         fipe_val = st.number_input("Valor FIPE do Carro", value=45000.0)
-        km_atual_input = st.number_input("KM Atual do Painel", value=100000.0, step=1.0)
-        prox_troca = st.number_input("KM da Próxima Troca de Óleo", value=km_atual_input + 10000, step=1.0)
+        km_atual_input = st.number_input("KM Atual do Painel", value=204650.0, step=1.0)
+        prox_troca = st.number_input("KM da Próxima Troca de Óleo", value=km_atual_input + 5000, step=1.0)
         if st.form_submit_button("SALVAR CONFIGURAÇÃO"):
-            cursor.execute("INSERT OR REPLACE INTO veiculo VALUES (?,?,?,?,?,?)", 
-                           (user, int(km_atual_input), int(prox_troca), 350.0, fipe_val, 0.0 if v_data is None else v_data[5]))
+            # Salvamos o km_ini (atual) e também o km_config (referência inicial)
+            cursor.execute("INSERT OR REPLACE INTO veiculo (usuario, km_ini, km_alvo, custo, fipe, guardado_ipva, km_config) VALUES (?,?,?,?,?,?,?)", 
+                           (user, int(km_atual_input), int(prox_troca), 350.0, fipe_val, 0.0 if v_data is None else v_data[5], int(km_atual_input)))
             conn.commit(); st.session_state.editando_veiculo = False; st.rerun()
     st.stop()
 
 km_atual_bd = int(v_data[1])
 km_alvo_revisao = int(v_data[2])
+km_inicial_config = int(v_data[6]) if len(v_data) > 6 else km_atual_bd
 
 # --- 4. PAINEL PRINCIPAL ---
 st.title(f"🚀 PAINEL: {user.upper()}")
@@ -110,105 +109,69 @@ with tab_resumo:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("💰 Fundo IPVA")
-        st.metric("Falta Guardar", f"R$ {total_ipva - guardado_ipva:.2f}", f"Total IPVA: R$ {total_ipva:.2f}")
-        val_ipva = st.number_input("Valor Operação IPVA (R$):", value=0.0, key="op_ipva")
-        ca, cb = st.columns(2)
-        if ca.button("📥 DEPOSITAR"):
+        st.metric("Falta Guardar", f"R$ {total_ipva - guardado_ipva:.2f}", f"Total: R$ {total_ipva:.2f}")
+        val_ipva = st.number_input("Valor Operação IPVA (R$):", value=0.0)
+        if st.button("📥 DEPOSITAR"):
             cursor.execute("UPDATE veiculo SET guardado_ipva = guardado_ipva + ? WHERE usuario=?", (val_ipva, user))
-            conn.commit(); st.rerun()
-        if cb.button("🗑️ ZERAR IPVA"):
-            cursor.execute("UPDATE veiculo SET guardado_ipva = 0 WHERE usuario=?", (user,))
             conn.commit(); st.rerun()
 
     with col2:
         st.subheader("🔧 Revisão (Troca de Óleo)")
         km_restante = km_alvo_revisao - km_atual_bd
-        # Cálculo de progresso baseado em uma janela de 10.000km
-        progresso_km = max(0.0, min(1.0, (1 - (km_restante / 10000)))) if km_restante > 0 else 1.0
+        intervalo_total = km_alvo_revisao - km_inicial_config
+        
+        # Cálculo de progresso real
+        if intervalo_total > 0:
+            progresso_km = max(0.0, min(1.0, (km_atual_bd - km_inicial_config) / intervalo_total))
+        else:
+            progresso_km = 1.0
         
         st.metric("KM Atual do Carro", f"{km_atual_bd} km")
         st.write(f"Próxima troca em: **{km_alvo_revisao} km**")
         st.progress(progresso_km)
         
-        if km_restante <= 500 and km_restante > 0:
-            st.warning(f"⚠️ Atenção! Falta pouco: {km_restante} km")
-        elif km_restante <= 0:
-            st.error(f"🚨 ULTRAPASSOU A TROCA EM {abs(km_restante)} km!")
+        if km_restante <= 0:
+            st.error(f"🚨 REVISÃO VENCIDA! Passou {abs(km_restante)} km")
+        elif km_restante <= 1000:
+            st.warning(f"⚠️ ALERTA: Falta apenas {km_restante} km para a troca!")
         else:
             st.info(f"Tudo certo. Faltam {km_restante} km.")
 
 with tab_ganhos:
-    meta_diaria = st.number_input("Sua Meta Diária (R$):", value=400.0, key="meta_val")
-    
+    meta_diaria = st.number_input("Sua Meta Diária (R$):", value=400.0)
     with st.form("ganho_diario", clear_on_submit=True):
         st.subheader("Registrar Trabalho")
         g1, g2, g3 = st.columns(3)
         v_bruto = g1.number_input("Ganhos Brutos (R$)")
         v_gastos = g2.number_input("Total Gastos (R$)")
-        v_km_rodada = g3.number_input("KM Rodada Hoje (Uber/99)", step=1.0)
-        
+        v_km_rodada = g3.number_input("KM Rodada Hoje", step=1.0)
         if st.form_submit_button("💾 SALVAR DIA E ATUALIZAR KM"):
-            # 1. Salva o histórico de ganhos
             cursor.execute("INSERT INTO ganhos (usuario, data, ganho, gasto, km, h_ini, h_fim) VALUES (?,?,?,?,?,?,?)", 
                            (user, str(hoje), v_bruto, v_gastos, int(v_km_rodada), "00:00", "00:00"))
-            # 2. AQUI A MÁGICA: Acrescenta a KM rodada ao KM ATUAL do veículo
             cursor.execute("UPDATE veiculo SET km_ini = km_ini + ? WHERE usuario=?", (int(v_km_rodada), user))
             conn.commit(); st.rerun()
 
-    # --- LÓGICA ACUMULATIVA ---
     df_h = pd.read_sql_query(f"SELECT * FROM ganhos WHERE usuario='{user}'", conn)
     if not df_h.empty:
         lucro_total = df_h['ganho'].sum() - df_h['gasto'].sum()
         meta_total = len(df_h) * meta_diaria
         if lucro_total >= meta_total:
             excedente = lucro_total - meta_total
-            st.markdown(f'<div class="card-meta meta-sucesso"><h1>META ACUMULADA ATINGIDA! 🎯</h1><p style="font-size: 50px; font-weight: bold;">R$ {lucro_total:.2f}</p><p>🚀 Parabéns! Você está com <b>R$ {excedente:.2f}</b> acima da meta total!</p></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="card-meta meta-sucesso"><h1>META ATINGIDA! 🎯</h1><p style="font-size: 50px; font-weight: bold;">R$ {lucro_total:.2f}</p><p>🚀 Parabéns! Extra de <b>R$ {excedente:.2f}</b>!</p></div>', unsafe_allow_html=True)
         else:
-            deficit = meta_total - lucro_total
-            st.markdown(f'<div class="card-meta meta-falta"><h1>DÉFICIT ACUMULADO ⚠️</h1><p style="font-size: 50px; font-weight: bold;">R$ {lucro_total:.2f}</p><p>Você está em déficit de <b>R$ {deficit:.2f}</b> em relação à meta total.</p></div>', unsafe_allow_html=True)
-
-    st.subheader("📜 Histórico")
-    df_show = df_h.sort_values(by='id', ascending=False)
-    for i, r in df_show.iterrows():
-        with st.container():
-            c_txt, c_del = st.columns([5, 1])
-            l_item = r['ganho'] - r['gasto']
-            cor = "#00FF7F" if l_item >= meta_diaria else "#FF4B4B"
-            c_txt.markdown(f"📅 {r['data']} | Lucro: <b style='color:{cor}'>R$ {l_item:.2f}</b> | Rodou: {int(r['km'])} km", unsafe_allow_html=True)
-            if c_del.button("🗑️", key=f"del_g_{r['id']}"):
-                # Se deletar o registro, a gente remove a KM que foi somada por erro
-                cursor.execute("UPDATE veiculo SET km_ini = km_ini - ? WHERE usuario=?", (r['km'], user))
-                cursor.execute("DELETE FROM ganhos WHERE id=?", (r['id'],))
-                conn.commit(); st.rerun()
+            st.markdown(f'<div class="card-meta meta-falta"><h1>DÉFICIT ⚠️</h1><p style="font-size: 50px; font-weight: bold;">R$ {lucro_total:.2f}</p><p>Faltam <b>R$ {meta_total - lucro_total:.2f}</b>.</p></div>', unsafe_allow_html=True)
 
 with tab_caixinhas:
-    st.subheader("🎯 Suas Caixinhas (Metas de Sonhos)")
-    with st.expander("➕ NOVA META"):
-        with st.form("meta_form"):
-            it = st.text_input("Objetivo (Ex: Viagem, Notebook)"); v = st.number_input("Valor Total Necessário")
-            if st.form_submit_button("CRIAR META"):
-                cursor.execute("INSERT INTO metas (usuario, item, valor, data, guardado) VALUES (?,?,?,?,?)", (user, it, v, str(hoje), 0.0))
-                conn.commit(); st.rerun()
-    
+    st.subheader("🎯 Suas Caixinhas")
     m_db = pd.read_sql_query(f"SELECT * FROM metas WHERE usuario='{user}'", conn)
     for i, m in m_db.iterrows():
         with st.container():
-            valor_guardado = m['guardado'] or 0.0
-            valor_objetivo = m['valor']
             st.write(f"### 🚀 {m['item']}")
-            # Texto mostrando o acumulado real
-            st.write(f"**💰 Saldo Atual: R$ {valor_guardado:.2f}** de **R$ {valor_objetivo:.2f}**")
-            
-            st.progress(min(valor_guardado/valor_objetivo, 1.0) if valor_objetivo > 0 else 0)
-            
-            v_m = st.number_input("Valor p/ Operação:", key=f"v_{m['id']}", value=0.0)
-            c1, c2, c3 = st.columns(3)
-            if c1.button("📥 Guardar", key=f"in_{m['id']}"):
+            st.write(f"**💰 Guardado: R$ {m['guardado']:.2f}** de **R$ {m['valor']:.2f}**")
+            st.progress(min(m['guardado']/m['valor'], 1.0) if m['valor'] > 0 else 0)
+            v_m = st.number_input("Valor:", key=f"v_{m['id']}", value=0.0)
+            if st.button("📥 Guardar", key=f"in_{m['id']}"):
                 cursor.execute("UPDATE metas SET guardado = guardado + ? WHERE id=?", (v_m, m['id'])); conn.commit(); st.rerun()
-            if c2.button("📤 Retirar", key=f"out_{m['id']}"):
-                cursor.execute("UPDATE metas SET guardado = guardado - ? WHERE id=?", (v_m, m['id'])); conn.commit(); st.rerun()
-            if c3.button("🗑️ Excluir", key=f"del_m_{m['id']}"):
-                cursor.execute("DELETE FROM metas WHERE id=?", (m['id'],)); conn.commit(); st.rerun()
 
 # --- SIDEBAR ---
 st.sidebar.title("⚙️ OPÇÕES")
@@ -216,10 +179,3 @@ if st.sidebar.button("🚗 RECONFIGURAR CARRO/KM"):
     st.session_state.editando_veiculo = True; st.rerun()
 if st.sidebar.button("🚪 SAIR DO APP"):
     st.session_state.autenticado = False; st.rerun()
-st.sidebar.markdown("---")
-st.sidebar.subheader("ZONA DE PERIGO")
-if st.sidebar.button("⚠️ ZERAR TODOS OS MEUS DADOS"):
-    cursor.execute("DELETE FROM ganhos WHERE usuario=?", (user,))
-    cursor.execute("DELETE FROM metas WHERE usuario=?", (user,))
-    cursor.execute("DELETE FROM veiculo WHERE usuario=?", (user,))
-    conn.commit(); st.rerun()
